@@ -6,6 +6,12 @@ let filtroAtual = 'TODOS'; // TODOS, FAVORITOS, HISTORICO
 let categoriaSelecionada = 'TODOS';
 let hlsInstance = null;
 
+// INSTÂNCIA GLOBAL DE ÁUDIO (Para tocar a rádio em segundo plano)
+let radioAudioInstance = null;
+
+// Caminho do arquivo de texto externo que conterá a URL da câmera
+const ARQUIVO_CONFIG_CAMERA = "config-camera.txt"; 
+
 // Elementos do DOM
 const DOM = {
     search: document.getElementById('search-input'),
@@ -106,12 +112,24 @@ String.prototype.stripOrNormal = function() {
     return this.trim();
 };
 
+// Busca assíncrona da URL da câmera contida no arquivo TXT externo
+async function obterUrlCameraExterna() {
+    try {
+        const resposta = await fetch(ARQUIVO_CONFIG_CAMERA);
+        if (!resposta.ok) throw new Error("Arquivo externo não encontrado");
+        const urlTexto = await resposta.text();
+        return urlTexto.trim(); // Retorna o link sem espaços ou quebras de linha
+    } catch (erro) {
+        console.warn("Falha ao ler URL externa. Usando fallback padrão.", erro);
+        // Fallback de contingência caso o arquivo TXT suma
+        return "https://cameras.santoandre.sp.gov.br/coi04/ID_597"; 
+    }
+}
+
 function popularCategorias() {
     const gruposUnicos = new Set(totalCanais.map(c => c.grupo));
-    // Garante ordenação alfabética, mas mantendo a estrutura limpa
     const gruposOrdenados = Array.from(gruposUnicos).sort();
     
-    // Força BRAZIL no topo da combobox se existir
     if(gruposOrdenados.includes("BRAZIL")) {
         gruposOrdenados.splice(gruposOrdenados.indexOf("BRAZIL"), 1);
         gruposOrdenados.unshift("BRAZIL");
@@ -131,19 +149,16 @@ function renderizarCanais() {
 
     let canaisFiltrados = [...totalCanais];
 
-    // Aplica Filtro Superior das Abas
     if (filtroAtual === 'FAVORITOS') {
         canaisFiltrados = canaisFiltrados.filter(c => favoritos.includes(c.url));
     } else if (filtroAtual === 'HISTORICO') {
         canaisFiltrados = historico.map(url => totalCanais.find(c => c.url === url)).filter(Boolean);
     }
 
-    // Aplica Filtro da Select Box de Categorias
     if (categoriaSelecionada !== 'TODOS' && filtroAtual === 'TODOS') {
         canaisFiltrados = canaisFiltrados.filter(c => c.grupo === categoriaSelecionada);
     }
 
-    // Aplica Filtro de Busca por Texto
     if (busca) {
         canaisFiltrados = canaisFiltrados.filter(c => c.nome.toLowerCase().includes(busca));
     }
@@ -153,7 +168,6 @@ function renderizarCanais() {
         return;
     }
 
-    // Placeholder seguro em formato SVG limpo
     const imgPlaceholder = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2'><rect x='2' y='2' width='20' height='20' rx='2.18' ry='2.18'></rect><line x1='7' y1='2' x2='7' y2='22'></line><line x1='17' y1='2' x2='17' y2='22'></line><line x1='2' y1='12' x2='22' y2='12'></line></svg>";
 
     canaisFiltrados.forEach(canal => {
@@ -161,11 +175,9 @@ function renderizarCanais() {
         item.className = 'channel-item';
         if (DOM.video.dataset.currentUrl === canal.url) item.classList.add('active');
 
-        // 1. Criação NATIVA e ISOLADA do elemento de imagem (Bloqueia vazamento de texto)
         const imgElement = document.createElement('img');
         imgElement.className = 'channel-logo';
         
-        // Limpa aspas extras que possam ter vindo do arquivo M3U do backend
         let limpaLogo = (canal.logo || '').replace(/['"]/g, '').trim();
         imgElement.src = limpaLogo || imgPlaceholder;
         
@@ -174,7 +186,6 @@ function renderizarCanais() {
             this.onerror = null;
         };
 
-        // 2. Criação do container de informações
         const infoContainer = document.createElement('div');
         infoContainer.className = 'channel-info';
         infoContainer.innerHTML = `
@@ -182,11 +193,9 @@ function renderizarCanais() {
             <div class="channel-group"></div>
         `;
         
-        // Injeta o nome e o grupo como TEXTO PURO (proteção extra contra scripts e quebras)
         infoContainer.querySelector('.channel-name').textContent = canal.nome;
         infoContainer.querySelector('.channel-group').textContent = canal.grupo;
 
-        // 3. Monta o item inserindo os elementos estruturados de forma segura
         item.appendChild(imgElement);
         item.appendChild(infoContainer);
 
@@ -195,13 +204,11 @@ function renderizarCanais() {
     });
 }
 
-function carregarCanalNoPlayer(canal) {
-    // Atualiza estado do DOM do item ativo
+async function carregarCanalNoPlayer(canal) {
     document.querySelectorAll('.channel-item').forEach(el => el.classList.remove('active'));
     DOM.video.dataset.currentUrl = canal.url;
-    renderizarCanais(); // Refaz lista para persistir marcador visual
+    renderizarCanais();
 
-    // Atualiza metadados do Rodapé do Player
     DOM.placeholder.classList.add('hidden');
     DOM.currentTitle.textContent = canal.nome;
     DOM.currentGroup.textContent = canal.grupo;
@@ -212,32 +219,42 @@ function carregarCanalNoPlayer(canal) {
         DOM.currentLogo.classList.add('hidden');
     }
 
-    // Gerencia exibição do botão favoritar
     DOM.btnFav.classList.remove('hidden');
     atualizarBotaoFavoritoUI(canal.url);
-
-    // Salva no Histórico
     gerenciarHistorico(canal.url);
 
-    // 1. Libera instâncias anteriores da biblioteca HLS se houver
+    // 1. Desliga qualquer rádio ativa de segundo plano ao mudar de canal
+    if (radioAudioInstance) {
+        radioAudioInstance.pause();
+        radioAudioInstance.src = "";
+        radioAudioInstance = null;
+    }
+
+    // 2. Destrói instâncias do HLS.js
     if (hlsInstance) {
         hlsInstance.destroy();
         hlsInstance = null;
     }
-    
-    // Reseta atributos estruturais da tag video para evitar heranças impeditivas
-    DOM.video.removeAttribute('src');
-    DOM.video.type = ""; 
 
-    // 2. DETECTOR DE ÁUDIO/RÁDIO UNIVERSAL
+    // 3. Remove iFrames estéticos antigos
+    const iframeAntigo = document.getElementById('iframe-estetico-radio');
+    if (iframeAntigo) {
+        iframeAntigo.remove();
+    }
+    
+    // Torna a tag de vídeo padrão visível novamente e restaura áudio
+    DOM.video.style.display = "block";
+    DOM.video.removeAttribute('src');
+    DOM.video.type = "";
+    DOM.video.muted = false;
+
+    // 4. DETECTOR DE ÁUDIO/RÁDIO
     const urlNormalizada = canal.url.toLowerCase();
     const isRadio = canal.grupo === "RADIOS" || urlNormalizada.includes("zeno.fm") || urlNormalizada.includes("zenofm.com");
 
     if (isRadio) {
-        // Correção de Mixed Content: Garante HTTPS no navegador para evitar bloqueios de segurança
         let urlSegura = canal.url.replace("http://", "https://");
         
-        // Limpa os sufixos estáticos exigidos pelo Televizo para que o motor HTML5 interprete como stream bruto
         if (urlSegura.endsWith("/playlist.m3u8")) {
             urlSegura = urlSegura.replace("/playlist.m3u8", "");
         } else if (urlSegura.endsWith(".m3u8") || urlSegura.endsWith(".m3u")) {
@@ -248,24 +265,50 @@ function carregarCanalNoPlayer(canal) {
             urlSegura = urlSegura.replace("/live", "");
         }
 
-        // Força a tag de vídeo a decodificar a transmissão estritamente como áudio contínuo
-        DOM.video.type = "audio/mpeg";
-        DOM.video.src = urlSegura;
+        // MOTOR A: Dispara o áudio limpo da rádio em background
+        radioAudioInstance = new Audio(urlSegura);
+        radioAudioInstance.play()
+            .then(() => atualizarStatus(`Áudio da Rádio ativo: ${canal.nome}`))
+            .catch(e => console.error("Erro no som da rádio:", e));
+
+        // LEITURA DINÂMICA: Pega a URL de vídeo configurada no TXT externo
+        const urlVisualExterna = await obterUrlCameraExterna();
+
+        // MOTOR B: Define se vai usar iFrame (link de página) ou tag de vídeo padrão (.m3u8)
+        if (urlVisualExterna.includes(".m3u8") || urlVisualExterna.includes(".mp4")) {
+            // Se for link de fluxo direto, usa o player nativo em modo mudo
+            DOM.video.muted = true;
+            if (Hls.isSupported()) {
+                hlsInstance = new Hls({ maxBufferLength: 10, enableWorker: true });
+                hlsInstance.loadSource(urlVisualExterna);
+                hlsInstance.attachMedia(DOM.video);
+                hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => { DOM.video.play(); });
+            } else if (DOM.video.canPlayType('application/vnd.apple.mpegurl')) {
+                DOM.video.src = urlVisualExterna;
+                DOM.video.addEventListener('loadedmetadata', () => { DOM.video.play(); });
+            }
+        } else {
+            // Se for link de página web (ex: prefeitura), esconde o vídeo e injeta o iFrame
+            DOM.video.style.display = "none"; 
+            
+            const iframeCamera = document.createElement('iframe');
+            iframeCamera.id = "iframe-estetico-radio";
+            iframeCamera.src = urlVisualExterna;
+            iframeCamera.style.width = "100%";
+            iframeCamera.style.height = "100%";
+            iframeCamera.style.border = "none";
+            iframeCamera.style.borderRadius = "4px";
+            iframeCamera.setAttribute("allow", "autoplay");
+            
+            DOM.video.parentElement.appendChild(iframeCamera);
+        }
         
-        DOM.video.play()
-            .then(() => atualizarStatus(`Transmitindo rádio: ${canal.nome}`))
-            .catch(erro => {
-                console.error("Erro na execução da rádio:", erro);
-                atualizarStatus(`Erro de rede ou mídia ao abrir rádio: ${canal.nome}`);
-            });
+        atualizarStatus(`Transmitindo rádio ${canal.nome} com imagem de fundo configurada.`);
             
     } else {
-        // 3. FLUXO PADRÃO (Canais de TV por assinatura / Vídeos via HLS.js)
+        // 5. FLUXO PADRÃO (Canais de TV Normais)
         if (Hls.isSupported()) {
-            hlsInstance = new Hls({
-                maxBufferLength: 10,
-                enableWorker: true
-            });
+            hlsInstance = new Hls({ maxBufferLength: 10, enableWorker: true });
             hlsInstance.loadSource(canal.url);
             hlsInstance.attachMedia(DOM.video);
             hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -276,9 +319,7 @@ function carregarCanalNoPlayer(canal) {
                     atualizarStatus(`Erro de rede ou mídia ao abrir: ${canal.nome}`);
                 }
             });
-        } 
-        // Suporte Nativo (Apple Safari / ecossistema iOS)
-        else if (DOM.video.canPlayType('application/vnd.apple.mpegurl')) {
+        } else if (DOM.video.canPlayType('application/vnd.apple.mpegurl')) {
             DOM.video.src = canal.url;
             DOM.video.addEventListener('loadedmetadata', () => {
                 DOM.video.play();
@@ -317,9 +358,9 @@ function atualizarBotaoFavoritoUI(url) {
 }
 
 function gerenciarHistorico(url) {
-    historico = historico.filter(h => h !== url); // Remove duplicatas antigas
-    historico.unshift(url); // Coloca no topo
-    if (historico.length > 20) historico.pop(); // Limita a 20 itens no histórico
+    historico = historico.filter(h => h !== url);
+    historico.unshift(url);
+    if (historico.length > 20) historico.pop();
     localStorage.setItem('bassetti_tv_historico', JSON.stringify(historico));
 }
 
