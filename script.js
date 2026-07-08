@@ -8,6 +8,7 @@ let hlsInstance = null;
 
 // INSTÂNCIA GLOBAL DE ÁUDIO (Para tocar a rádio em segundo plano)
 let radioAudioInstance = null;
+let monitoramentoRadioInterval = null;
 
 // Caminho do arquivo de texto externo que conterá a URL da câmera
 const ARQUIVO_CONFIG_CAMERA = "config-camera.txt"; 
@@ -118,12 +119,31 @@ async function obterUrlCameraExterna() {
         const resposta = await fetch(ARQUIVO_CONFIG_CAMERA);
         if (!resposta.ok) throw new Error("Arquivo externo não encontrado");
         const urlTexto = await resposta.text();
-        return urlTexto.trim(); // Retorna o link sem espaços ou quebras de linha
+        return urlTexto.trim();
     } catch (erro) {
         console.warn("Falha ao ler URL externa. Usando fallback padrão.", erro);
-        // Fallback de contingência caso o arquivo TXT suma
         return "https://cameras.santoandre.sp.gov.br/coi04/ID_597"; 
     }
+}
+
+// Reconhece nativamente se a URL de streaming de áudio está respondendo
+function verificarSinalStream(url) {
+    return new Promise(resolve => {
+        const testeAudio = new Audio();
+        const finalizar = (resultado) => {
+            resolve(resultado);
+            testeAudio.src = "";
+        };
+        testeAudio.onplaying = () => finalizar(true);
+        testeAudio.oncanplaythrough = () => finalizar(true);
+        testeAudio.onerror = () => finalizar(false);
+        testeAudio.onstalled = () => finalizar(false);
+
+        testeAudio.src = url + (url.includes("?") ? "&" : "?") + "t=" + Date.now();
+        testeAudio.load();
+
+        setTimeout(() => finalizar(false), 4000);
+    });
 }
 
 function popularCategorias() {
@@ -223,32 +243,37 @@ async function carregarCanalNoPlayer(canal) {
     atualizarBotaoFavoritoUI(canal.url);
     gerenciarHistorico(canal.url);
 
-    // 1. Desliga qualquer rádio ativa de segundo plano ao mudar de canal
+    // Limpa loops de checagem anteriores
+    if (monitoramentoRadioInterval) {
+        clearInterval(monitoramentoRadioInterval);
+        monitoramentoRadioInterval = null;
+    }
+
+    // Desliga rádio ativa de segundo plano ao mudar de canal
     if (radioAudioInstance) {
         radioAudioInstance.pause();
         radioAudioInstance.src = "";
         radioAudioInstance = null;
     }
 
-    // 2. Destrói instâncias do HLS.js
+    // Destrói instâncias do HLS.js
     if (hlsInstance) {
         hlsInstance.destroy();
         hlsInstance = null;
     }
 
-    // 3. Remove iFrames estéticos antigos
+    // Remove iFrames estéticos antigos
     const iframeAntigo = document.getElementById('iframe-estetico-radio');
     if (iframeAntigo) {
         iframeAntigo.remove();
     }
     
-    // Torna a tag de vídeo padrão visível novamente e restaura áudio
     DOM.video.style.display = "block";
     DOM.video.removeAttribute('src');
     DOM.video.type = "";
-    DOM.video.muted = false;
+    DOM.video.muted = false; // Áudio padrão ativado inicialmente
 
-    // 4. DETECTOR DE ÁUDIO/RÁDIO
+    // DETECTOR DE ÁUDIO/RÁDIO
     const urlNormalizada = canal.url.toLowerCase();
     const isRadio = canal.grupo === "RADIOS" || urlNormalizada.includes("zeno.fm") || urlNormalizada.includes("zenofm.com");
 
@@ -265,19 +290,11 @@ async function carregarCanalNoPlayer(canal) {
             urlSegura = urlSegura.replace("/live", "");
         }
 
-        // MOTOR A: Dispara o áudio limpo da rádio em background
-        radioAudioInstance = new Audio(urlSegura);
-        radioAudioInstance.play()
-            .then(() => atualizarStatus(`Áudio da Rádio ativo: ${canal.nome}`))
-            .catch(e => console.error("Erro no som da rádio:", e));
-
-        // LEITURA DINÂMICA: Pega a URL de vídeo configurada no TXT externo
+        // LEITURA DINÂMICA DO ARQUIVO EXTERNO (.txt)
         const urlVisualExterna = await obterUrlCameraExterna();
 
-        // MOTOR B: Define se vai usar iFrame (link de página) ou tag de vídeo padrão (.m3u8)
+        // INICIALIZAÇÃO DO VISUAL DA TRANSMISSÃO (iFrame ou Player HLS)
         if (urlVisualExterna.includes(".m3u8") || urlVisualExterna.includes(".mp4")) {
-            // Se for link de fluxo direto, usa o player nativo em modo mudo
-            DOM.video.muted = true;
             if (Hls.isSupported()) {
                 hlsInstance = new Hls({ maxBufferLength: 10, enableWorker: true });
                 hlsInstance.loadSource(urlVisualExterna);
@@ -288,9 +305,7 @@ async function carregarCanalNoPlayer(canal) {
                 DOM.video.addEventListener('loadedmetadata', () => { DOM.video.play(); });
             }
         } else {
-            // Se for link de página web (ex: prefeitura), esconde o vídeo e injeta o iFrame
             DOM.video.style.display = "none"; 
-            
             const iframeCamera = document.createElement('iframe');
             iframeCamera.id = "iframe-estetico-radio";
             iframeCamera.src = urlVisualExterna;
@@ -299,14 +314,41 @@ async function carregarCanalNoPlayer(canal) {
             iframeCamera.style.border = "none";
             iframeCamera.style.borderRadius = "4px";
             iframeCamera.setAttribute("allow", "autoplay");
-            
             DOM.video.parentElement.appendChild(iframeCamera);
         }
-        
-        atualizarStatus(`Transmitindo rádio ${canal.nome} com imagem de fundo configurada.`);
+
+        // FUNÇÃO DE GERENCIAMENTO INTELIGENTE DE SINAL (FAILOVER)
+        const gerenciarSinalAudio = async () => {
+            const radioOnline = await verificarSinalStream(urlSegura);
+
+            if (radioOnline) {
+                // SINAL DA RÁDIO OK: Muta a transmissão da TV/Câmera e prioriza a rádio
+                DOM.video.muted = true;
+                if (!radioAudioInstance) {
+                    radioAudioInstance = new Audio(urlSegura);
+                    radioAudioInstance.play()
+                        .then(() => atualizarStatus(`Rádio Online: Transmitindo ${canal.nome} + Vídeo de Fundo`))
+                        .catch(e => console.error("Erro ao dar play no áudio da rádio:", e));
+                }
+            } else {
+                // SEM SINAL DA RÁDIO: Desliga a instância da rádio e libera o som original do streaming da TV/Câmera
+                if (radioAudioInstance) {
+                    radioAudioInstance.pause();
+                    radioAudioInstance.src = "";
+                    radioAudioInstance = null;
+                }
+                DOM.video.muted = false; 
+                atualizarStatus(`Rádio Offline. Reproduzindo áudio original do canal de vídeo.`);
+            }
+        };
+
+        // Roda a checagem imediatamente no clique
+        await gerenciarSinalAudio();
+        // Deixa monitorando o sinal a cada 8 segundos para evitar quedas abruptas
+        monitoramentoRadioInterval = setInterval(gerenciarSinalAudio, 8000);
             
     } else {
-        // 5. FLUXO PADRÃO (Canais de TV Normais)
+        // FLUXO PADRÃO (Canais de TV Normais)
         if (Hls.isSupported()) {
             hlsInstance = new Hls({ maxBufferLength: 10, enableWorker: true });
             hlsInstance.loadSource(canal.url);
